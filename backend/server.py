@@ -18,6 +18,10 @@ Arrancar:  .venv/bin/uvicorn server:app --reload --port 8000   →   http://loca
 from __future__ import annotations
 
 import asyncio
+import json
+import os
+import re
+import unicodedata
 import uuid
 from pathlib import Path
 from contextlib import asynccontextmanager
@@ -31,6 +35,20 @@ from pydantic import BaseModel
 from oficina import events
 from oficina.agents import AGENTES
 from oficina.graph import construir_grafo, nueva_idea, responder
+
+
+# ───────────────────────────── Persistencia ─────────────────────────────
+# Cada proyecto vive en Proyectos-De-Oficina/<slug>/ (en la raíz del repo, o donde diga
+# OFICINA_PROYECTOS_DIR): idea.md, chat.json, estado.json y un .md por entregable.
+PROYECTOS_DIR = Path(
+    os.getenv("OFICINA_PROYECTOS_DIR") or Path(__file__).resolve().parent.parent / "Proyectos-De-Oficina"
+)
+
+
+def _slug(idea: str) -> str:
+    base = unicodedata.normalize("NFKD", idea).encode("ascii", "ignore").decode()
+    base = re.sub(r"[^a-z0-9]+", "-", base.lower()).strip("-")[:40].strip("-") or "proyecto"
+    return f"{base}-{uuid.uuid4().hex[:6]}"
 
 
 # ───────────────────────────── Estado de la oficina ─────────────────────────────
@@ -53,6 +71,22 @@ class Oficina:
         self.proyecto: str | None = None
         self.estado: Literal["libre", "trabajando", "esperando_fundador", "terminado", "error"] = "libre"
         self.final: dict | None = None
+        self.carpeta: Path | None = None
+
+    def guardar(self) -> None:
+        """Vuelca el proyecto actual a su carpeta. Un fallo de disco no debe tumbar el flujo."""
+        if not self.carpeta:
+            return
+        try:
+            self.carpeta.mkdir(parents=True, exist_ok=True)
+            (self.carpeta / "chat.json").write_text(json.dumps(self.chat, ensure_ascii=False, indent=2))
+            (self.carpeta / "estado.json").write_text(
+                json.dumps({"proyecto": self.proyecto, "estado": self.estado, "decision": (self.final or {}).get("decision")}, ensure_ascii=False, indent=2)
+            )
+            for aid, texto in ((self.final or {}).get("entregables") or {}).items():
+                (self.carpeta / f"{aid}.md").write_text(texto)
+        except OSError as ex:
+            print(f"[oficina] no se pudo guardar el proyecto: {ex}")
 
     def snapshot(self) -> dict:
         return {
@@ -92,6 +126,7 @@ class Oficina:
     def _chat(self, agente: str, texto: str, ts: str) -> None:
         item = {"agente": agente, "texto": texto, "ts": ts}
         self.chat.append(item)
+        self.guardar()
         self.difundir({"type": "chat", **item})
 
     # — ejecución del grafo (síncrona, en un hilo) —
@@ -112,6 +147,7 @@ class Oficina:
                 a["estado"] = events.INACTIVO
             self.difundir(self.snapshot())
             self.difundir({"type": "error", "detalle": f"{type(ex).__name__}: {ex}"})
+            self.guardar()
             return
         if res.get("__interrupt__"):
             self.estado = "esperando_fundador"
@@ -121,6 +157,7 @@ class Oficina:
             self.estado = "terminado"
             self.final = {"decision": res.get("decision"), "entregables": res.get("entregables", {})}
             self.difundir({"type": "fin", **self.final})
+        self.guardar()
 
 
 oficina = Oficina()
@@ -156,6 +193,23 @@ def estado() -> dict:
     return oficina.snapshot()
 
 
+@app.get("/api/proyectos")
+def proyectos() -> list[dict]:
+    """Proyectos guardados en disco, el más reciente primero."""
+    if not PROYECTOS_DIR.is_dir():
+        return []
+    out = []
+    for d in sorted(PROYECTOS_DIR.iterdir(), key=lambda d: d.stat().st_mtime, reverse=True):
+        if not (d / "idea.md").is_file():
+            continue
+        try:
+            estado = json.loads((d / "estado.json").read_text()).get("estado")
+        except (OSError, ValueError):
+            estado = None
+        out.append({"carpeta": d.name, "idea": (d / "idea.md").read_text().split("\n", 2)[-1].strip(), "estado": estado})
+    return out
+
+
 @app.post("/api/ideas", status_code=202)
 async def crear_idea(body: IdeaIn) -> dict:
     if oficina.estado in ("trabajando", "esperando_fundador"):
@@ -164,6 +218,9 @@ async def crear_idea(body: IdeaIn) -> dict:
         raise HTTPException(422, "La idea no puede estar vacía.")
     oficina.reiniciar()
     oficina.proyecto = str(uuid.uuid4())
+    oficina.carpeta = PROYECTOS_DIR / _slug(body.idea)
+    oficina.carpeta.mkdir(parents=True, exist_ok=True)
+    (oficina.carpeta / "idea.md").write_text(f"# Idea\n\n{body.idea.strip()}\n")
     oficina._chat("fundador", body.idea, events.datetime.now(events.timezone.utc).isoformat())
     asyncio.create_task(
         asyncio.to_thread(oficina.ejecutar, lambda: nueva_idea(oficina.grafo, body.idea, oficina.proyecto))
